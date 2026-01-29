@@ -1,0 +1,12 @@
+{
+  "name": "puzzle-guardians-backend-v2",
+  "version": "2.0.0",
+  "description": "Puzzle & Guardians Backend with Vercel Postgres",
+  "dependencies": {
+    "ethers": "^5.7.2",
+    "@vercel/postgres": "^0.5.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
