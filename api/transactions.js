@@ -14,7 +14,7 @@ module.exports = async (req, res) => {
   try {
     console.log('📊 트랜잭션 조회 중...');
 
-    // DB에서 모든 트랜잭션 조회 (최신순)
+    // DB에서 실제 트랜잭션만 조회 (MARKER 제외, 최신순)
     const result = await sql`
       SELECT 
         tx_hash,
@@ -24,6 +24,7 @@ module.exports = async (req, res) => {
         amount,
         token
       FROM transactions
+      WHERE token != 'MARKER'
       ORDER BY timestamp DESC
     `;
 
