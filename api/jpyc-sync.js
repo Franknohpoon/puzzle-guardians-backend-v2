@@ -113,6 +113,9 @@ module.exports = async (req, res) => {
         await sql`CREATE INDEX IF NOT EXISTS idx_jpyc_mission ON jpyc_transactions(mission_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_jpyc_timestamp ON jpyc_transactions(timestamp)`;
 
+        // 미션 외 송금(미분류)은 저장하지 않음 — 과거에 저장된 미분류 행 정리
+        await sql`DELETE FROM jpyc_transactions WHERE mission_id IS NULL`;
+
         // 시작 블록
         const lastBlockResult = await sql`SELECT MAX(block_number) as max_block FROM jpyc_transactions`;
         const fromBlock = lastBlockResult.rows[0]?.max_block
@@ -172,6 +175,7 @@ module.exports = async (req, res) => {
             const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
             const timestampMs = tsSec * 1000;
             const mission = identifyMission(amount, timestampMs);
+            if (!mission) continue; // 미션 해당 금액(10/50/200)만 저장
             rows.push([
                 log.transactionHash,
                 JPYC_WALLET.toLowerCase(),

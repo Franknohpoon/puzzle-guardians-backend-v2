@@ -6,7 +6,7 @@ const { sql } = require('@vercel/postgres');
 
 const WALLET_ADDRESS = '0x3156f02e943cefb0247283b7f89b4ebf91133cff';
 const BORA_TOKEN_ADDRESS = '0x02cbe46fb8a1f579254a9b485788f2d86cad51aa';
-const KAIA_RPC = 'https://kaia.blockpi.network/v1/rpc/public';
+const KAIA_RPC = process.env.KAIA_RPC || 'https://public-en.node.kaia.io';
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 
 module.exports = async (req, res) => {

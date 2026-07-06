@@ -10,6 +10,10 @@
     {
       "path": "/api/sync",
       "schedule": "0 0 * * *"
+    },
+    {
+      "path": "/api/jpyc-sync",
+      "schedule": "0 1 * * *"
     }
   ]
 }
