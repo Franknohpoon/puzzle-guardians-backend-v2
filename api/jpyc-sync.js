@@ -1,6 +1,6 @@
 // api/jpyc-sync.js
 // Unifi JPYC 미션 데이터 동기화
-// 온체인 JPYC Transfer 로그를 Kaia RPC에서 직접 읽어 저장 (api/sync.js 와 동일한 방식)
+// 온체인 JPYC Transfer 로그를 Kaia RPC(raw JSON-RPC)에서 직접 읽어 저장
 
 const { ethers } = require('ethers');
 const { sql } = require('@vercel/postgres');
@@ -14,8 +14,10 @@ const KAIA_RPC = process.env.KAIA_RPC || 'https://public-en.node.kaia.io';
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // 첫 지급 블록(219,669,879) 직전 — 최초 동기화 시작점
 const INITIAL_BLOCK = 219600000;
-// 한 번에 조회할 블록 범위
-const CHUNK_SIZE = 500000;
+const LOG_CHUNK = 300000;   // getLogs 한 번에 조회할 블록 범위
+const TS_BATCH = 100;       // 블록 타임스탬프 배치 요청 크기
+const INSERT_BATCH = 200;   // 벌크 INSERT 행 수
+const MAX_BLOCKS_PER_RUN = 2000000; // 한 호출당 처리 상한 (안전장치)
 
 // 미션 정의
 const MISSIONS = {
@@ -43,37 +45,55 @@ const MISSIONS = {
 };
 
 // 트랜잭션을 미션으로 분류 (timestamp: ms epoch)
-function identifyMission(tx) {
-    const amount = parseFloat(tx.amount);
-    const timestamp = new Date(tx.timestamp);
-
-    // 200 JPYC = 덱 전투력 6666
-    if (amount === 200) {
-        return MISSIONS.POWER6666;
-    }
-
-    // 50 JPYC = Phase 2 (7/2 12:00 이후)
-    if (amount === 50 && timestamp >= MISSIONS.LEVEL5_PHASE2.startDate) {
-        return MISSIONS.LEVEL5_PHASE2;
-    }
-
-    // 10 JPYC = Phase 1 (7/2 12:00 이전)
-    if (amount === 10 && timestamp < MISSIONS.LEVEL5_PHASE2.startDate) {
-        return MISSIONS.LEVEL5_PHASE1;
-    }
-
+function identifyMission(amount, timestampMs) {
+    const t = new Date(timestampMs);
+    if (amount === 200) return MISSIONS.POWER6666;
+    if (amount === 50 && t >= MISSIONS.LEVEL5_PHASE2.startDate) return MISSIONS.LEVEL5_PHASE2;
+    if (amount === 10 && t < MISSIONS.LEVEL5_PHASE2.startDate) return MISSIONS.LEVEL5_PHASE1;
     return null;
+}
+
+// raw JSON-RPC 호출 (타임아웃/재시도 제어)
+async function rpc(method, params, timeoutMs = 20000) {
+    return rpcBatch([{ method, params, id: 1 }], timeoutMs).then(r => r[0]);
+}
+
+async function rpcBatch(calls, timeoutMs = 30000) {
+    const body = calls.map((c, i) => ({
+        jsonrpc: '2.0',
+        id: c.id ?? i,
+        method: c.method,
+        params: c.params
+    }));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const resp = await fetch(KAIA_RPC, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: controller.signal
+        });
+        if (!resp.ok) throw new Error(`RPC HTTP ${resp.status}`);
+        const json = await resp.json();
+        const arr = Array.isArray(json) ? json : [json];
+        // id 순서 보장
+        const byId = {};
+        for (const r of arr) byId[r.id] = r;
+        return body.map(b => byId[b.id]?.result ?? null);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 module.exports = async (req, res) => {
     try {
-        // CORS 헤더
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, POST');
 
         console.log('🚀 JPYC 미션 동기화 시작...');
 
-        // 테이블 생성 (없으면)
+        // 테이블 / 인덱스
         await sql`
             CREATE TABLE IF NOT EXISTS jpyc_transactions (
                 id SERIAL PRIMARY KEY,
@@ -89,139 +109,130 @@ module.exports = async (req, res) => {
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         `;
-
-        // 인덱스 생성
         await sql`CREATE INDEX IF NOT EXISTS idx_jpyc_to ON jpyc_transactions(to_address)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_jpyc_mission ON jpyc_transactions(mission_id)`;
         await sql`CREATE INDEX IF NOT EXISTS idx_jpyc_timestamp ON jpyc_transactions(timestamp)`;
 
-        // 마지막 동기화 블록 확인
-        const lastBlockResult = await sql`
-            SELECT MAX(block_number) as max_block FROM jpyc_transactions
-        `;
+        // 시작 블록
+        const lastBlockResult = await sql`SELECT MAX(block_number) as max_block FROM jpyc_transactions`;
         const fromBlock = lastBlockResult.rows[0]?.max_block
             ? parseInt(lastBlockResult.rows[0].max_block) + 1
             : INITIAL_BLOCK;
 
-        const provider = new ethers.providers.JsonRpcProvider(KAIA_RPC);
-        const latestBlock = await provider.getBlockNumber();
+        const latestHex = await rpc('eth_blockNumber', []);
+        const latestBlock = parseInt(latestHex, 16);
+        const toBlock = Math.min(fromBlock + MAX_BLOCKS_PER_RUN - 1, latestBlock);
 
-        console.log(`📍 조회 범위: ${fromBlock} ~ ${latestBlock}`);
+        console.log(`📍 조회 범위: ${fromBlock} ~ ${toBlock} (latest ${latestBlock})`);
 
         if (fromBlock > latestBlock) {
-            const stats = await getStats();
             return res.status(200).json({
-                success: true,
-                totalSynced: 0,
-                message: '새 블록 없음',
-                missions: stats,
-                timestamp: new Date().toISOString()
+                success: true, totalSynced: 0, message: '새 블록 없음',
+                missions: await getStats(), timestamp: new Date().toISOString()
             });
         }
 
-        // JPYC Transfer 로그 조회 (from = 지급 지갑) — 500k 블록씩
+        // 1) getLogs (from = 지급 지갑) — LOG_CHUNK 씩
+        const fromTopic = ethers.utils.hexZeroPad(JPYC_WALLET, 32);
         const allLogs = [];
-        for (let currentFrom = fromBlock; currentFrom <= latestBlock; currentFrom += CHUNK_SIZE) {
-            const currentTo = Math.min(currentFrom + CHUNK_SIZE - 1, latestBlock);
-            try {
-                const logs = await provider.getLogs({
-                    fromBlock: currentFrom,
-                    toBlock: currentTo,
-                    address: JPYC_TOKEN_ADDRESS,
-                    topics: [
-                        TRANSFER_TOPIC,
-                        ethers.utils.hexZeroPad(JPYC_WALLET, 32), // from (지급 지갑)
-                        null // to (any user)
-                    ]
-                });
-                allLogs.push(...logs);
-                console.log(`  블록 ${currentFrom}~${currentTo}: ${logs.length}개`);
-            } catch (error) {
-                console.warn(`  블록 조회 실패 (${currentFrom}~${currentTo}):`, error.message);
-            }
-            await new Promise(resolve => setTimeout(resolve, 100));
+        for (let cf = fromBlock; cf <= toBlock; cf += LOG_CHUNK) {
+            const ct = Math.min(cf + LOG_CHUNK - 1, toBlock);
+            const logs = await rpc('eth_getLogs', [{
+                fromBlock: '0x' + cf.toString(16),
+                toBlock: '0x' + ct.toString(16),
+                address: JPYC_TOKEN_ADDRESS,
+                topics: [TRANSFER_TOPIC, fromTopic, null]
+            }], 40000);
+            if (Array.isArray(logs)) allLogs.push(...logs);
+            console.log(`  블록 ${cf}~${ct}: ${Array.isArray(logs) ? logs.length : 'ERR'}개`);
         }
+        console.log(`✅ 총 ${allLogs.length}개 Transfer 로그`);
 
-        console.log(`✅ 총 ${allLogs.length}개 Transfer 로그 발견`);
-
-        // 블록 타임스탬프 조회 (동시성 배치로 캐시)
-        const uniqueBlocks = [...new Set(allLogs.map(l => l.blockNumber))];
+        // 2) 블록 타임스탬프 배치 조회
+        const uniqueBlocks = [...new Set(allLogs.map(l => l.blockNumber))]; // hex 문자열
         const blockTs = {};
-        const BATCH = 12;
-        for (let i = 0; i < uniqueBlocks.length; i += BATCH) {
-            const batch = uniqueBlocks.slice(i, i + BATCH);
-            const results = await Promise.all(
-                batch.map(bn => provider.getBlock(bn).catch(() => null))
+        for (let i = 0; i < uniqueBlocks.length; i += TS_BATCH) {
+            const batch = uniqueBlocks.slice(i, i + TS_BATCH);
+            const results = await rpcBatch(
+                batch.map((bn, idx) => ({ method: 'eth_getBlockByNumber', params: [bn, false], id: idx })),
+                40000
             );
             batch.forEach((bn, idx) => {
-                if (results[idx]) blockTs[bn] = results[idx].timestamp; // seconds
+                const blk = results[idx];
+                if (blk && blk.timestamp) blockTs[bn] = parseInt(blk.timestamp, 16); // seconds
             });
         }
 
-        // 저장
-        let totalSynced = 0;
+        // 3) 행 구성
+        const rows = [];
         for (const log of allLogs) {
+            const tsSec = blockTs[log.blockNumber];
+            if (!tsSec) continue;
+            const amount = parseFloat(ethers.utils.formatUnits(ethers.BigNumber.from(log.data), 18));
+            const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
+            const timestampMs = tsSec * 1000;
+            const mission = identifyMission(amount, timestampMs);
+            rows.push([
+                log.transactionHash,
+                JPYC_WALLET.toLowerCase(),
+                to,
+                amount,
+                parseInt(log.blockNumber, 16),
+                timestampMs,
+                mission?.id || null,
+                mission?.name || null
+            ]);
+        }
+
+        // 4) 벌크 INSERT (INSERT_BATCH 행씩)
+        let totalSynced = 0;
+        for (let i = 0; i < rows.length; i += INSERT_BATCH) {
+            const batch = rows.slice(i, i + INSERT_BATCH);
+            const values = [];
+            const placeholders = batch.map((r, ri) => {
+                const b = ri * 8;
+                values.push(...r);
+                return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8})`;
+            }).join(',');
+            const text = `
+                INSERT INTO jpyc_transactions
+                (tx_hash, from_address, to_address, amount, block_number, timestamp, mission_id, mission_name)
+                VALUES ${placeholders}
+                ON CONFLICT (tx_hash) DO NOTHING
+            `;
             try {
-                const tsSec = blockTs[log.blockNumber];
-                if (!tsSec) continue; // 타임스탬프 조회 실패 건은 스킵 (다음 동기화 때 재시도)
-
-                const amount = parseFloat(ethers.utils.formatEther(log.data)); // 18 decimals
-                const to = ethers.utils.getAddress('0x' + log.topics[2].slice(26)).toLowerCase();
-                const timestampMs = tsSec * 1000; // 프론트/미션 분류가 ms 기준
-
-                const mission = identifyMission({ amount, timestamp: timestampMs });
-
-                await sql`
-                    INSERT INTO jpyc_transactions
-                    (tx_hash, from_address, to_address, amount, block_number, timestamp, mission_id, mission_name)
-                    VALUES (
-                        ${log.transactionHash},
-                        ${JPYC_WALLET.toLowerCase()},
-                        ${to},
-                        ${amount},
-                        ${log.blockNumber},
-                        ${timestampMs},
-                        ${mission?.id || null},
-                        ${mission?.name || null}
-                    )
-                    ON CONFLICT (tx_hash) DO NOTHING
-                `;
-                totalSynced++;
+                const r = await sql.query(text, values);
+                totalSynced += r.rowCount || 0;
             } catch (err) {
-                console.error(`❌ Insert 오류: ${err.message}`);
+                console.error(`❌ Bulk insert 오류: ${err.message}`);
             }
         }
 
-        const stats = await getStats();
+        console.log(`💾 ${totalSynced}건 저장`);
 
         return res.status(200).json({
             success: true,
             fromBlock,
-            toBlock: latestBlock,
+            toBlock,
+            latestBlock,
             logsFound: allLogs.length,
             totalSynced,
-            missions: stats,
+            missions: await getStats(),
             timestamp: new Date().toISOString()
         });
 
     } catch (error) {
         console.error('❌ Sync 오류:', error);
-        return res.status(500).json({
-            error: error.message,
-            stack: error.stack
-        });
+        return res.status(500).json({ error: error.message, stack: error.stack });
     }
 };
 
-// 미션별 통계
 async function getStats() {
     const stats = await sql`
-        SELECT
-            mission_id,
-            mission_name,
-            COUNT(*) as claim_count,
-            COUNT(DISTINCT to_address) as unique_users,
-            SUM(amount) as total_paid
+        SELECT mission_id, mission_name,
+               COUNT(*) as claim_count,
+               COUNT(DISTINCT to_address) as unique_users,
+               SUM(amount) as total_paid
         FROM jpyc_transactions
         WHERE mission_id IS NOT NULL
         GROUP BY mission_id, mission_name
